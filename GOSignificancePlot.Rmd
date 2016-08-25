@@ -1,0 +1,153 @@
+---
+title: "GOSignificancePlot"
+author: "Joshua Burkhart"
+date: "August 10, 2016"
+output: 
+  pdf_document: 
+    latex_engine: xelatex
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      results='hide', # markup marks up the results; asis return texts as-is; hide hides the results
+                      comment=NA,
+                      messages=FALSE,
+                      warnings=FALSE,
+                      error=FALSE,
+                      fig.path="Figs/"
+                      )
+```
+
+```{r libs, include=FALSE}
+library(knitr)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+library(xlsx)
+library(VennDiagram)
+library(GOstats)
+library(ALL)
+library(GO.db)
+library(annotate)
+library(genefilter)
+library(RColorBrewer)
+library(xtable)
+library(Rgraphviz)
+library(mouse4302.db)
+library(GOplot)
+library(pander)
+library(biomaRt)
+```
+
+```{r globals}
+# Assume working directory matches source file location
+# R Studio: Session->Set Working Directory->To Source File Location
+#setwd("/Users/joshuaburkhart/SoftwareProjects/CellFusionAnalysis/src/GOAnalysisVisualization/")
+ANOVA_DATA_ZIPPED <- "../../data/Copy of ANOVA Results February 06 2014.csv.zip"
+ANOVA_DATA_UNZIPPED_tmp <- "Copy of ANOVA Results February 06 2014.csv"
+```
+
+# GO Significance Plots
+
+## 30 Most Significantly Enriched GO Categories
+#### This figure was produced using categories discovered using the GOstats library for genes significantly up-regulated in both Macrophage vs MC-38 and Hybrid vs MC-38 comparisons.
+
+```{r go_plot}
+# Read ANOVA data
+unzip(ANOVA_DATA_ZIPPED)
+anova_df <- read.table(ANOVA_DATA_UNZIPPED_tmp,header=T,sep="\t") %>%
+  dplyr::mutate(probesetid = as.character(probesetid)) %>%
+  dplyr::filter(!grepl("^AFFX",probesetid)) %>%
+  dplyr::mutate(probesetid = gsub("^v","",probesetid))
+file.remove(ANOVA_DATA_UNZIPPED_tmp) 
+
+# From Falcon, S., Gentleman, R., How To Use GOstats Testing Gene Lists for GO Term Association, 2016, https://www.bioconductor.org/packages/release/bioc/vignettes/GOstats/inst/doc/GOstatsHyperG.pdf
+
+## Remove genes that have no entrezGene id
+entrezIds <- mget(anova_df$probesetid, envir=mouse4302ENTREZID, ifnotfound = NA)
+anova_df$entrezIds <- entrezIds
+haveEntrezId <- names(entrezIds[sapply(entrezIds,function(x) !is.na(x))])
+numNoEntrezId <- length(anova_df$probesetid) - length(haveEntrezId)
+anova_df <- anova_df %>% dplyr::filter(!is.na(entrezIds[probesetid]))
+
+## Remove genes with no GO mapping
+haveGo <- sapply(mget(anova_df$probesetid,mouse4302GO),
+  function(x) {
+    if(length(x) == 1 && is.na(x))
+      FALSE
+    else TRUE
+  })
+numNoGO <- sum(!haveGo)
+anova_df <- anova_df[haveGo,]
+
+## Non-specific filtering based on IQR
+iqrCutoff <- 0.5 # not using this
+anova_df$probesetidIqr <- apply(
+  anova_df %>% dplyr::select(
+    mc38mac1,mc38mac2,mc38mac3,mc38mac4,mc38mac5, # Hybrid
+    mc381,mc382,mc383,                            # MC-38
+    mac1,mac2,mac3                                # Macrophage
+    ),1,IQR)
+
+numNsWithDups <- length(anova_df$probesetid)
+nsFilteredIqr <- anova_df$probesetidIqr
+uniqGenes <- genefilter::findLargest(anova_df$probesetid,nsFilteredIqr,"mouse4302")
+nsFiltered <- anova_df %>% dplyr::filter(probesetid %in% uniqGenes)
+numSelected <- length(nsFiltered$probesetid)
+
+## Define gene universe based on results of non-specific filtering
+affyUniverse <- nsFiltered$probesetid
+entrezUniverse <- unlist(mget(affyUniverse, mouse4302ENTREZID))
+if(any(duplicated(entrezUniverse)))
+  stop("error in gene universe: can't have duplicate Entrez Gene Ids")
+## Also define an alternate universe based on the entire chip
+chipAffyUniverse <- anova_df$probesetid
+chipEntrezUniverse <- mget(chipAffyUniverse,mouse4302ENTREZID)
+chipEntrezUniverse <- unique(unlist(chipEntrezUniverse))
+
+### Up regulated with at least 2-fold change in Macrophage and Hybrid vs MC-38
+atLeast2FoldChange <- nsFiltered %>% dplyr::filter(
+  sig21 == 1,
+  sig31 == 1,
+  d21 > 2,
+  d31 > 2
+)
+
+selectedEntrezIds <- unlist(mget(atLeast2FoldChange$probesetid,mouse4302ENTREZID))
+
+hgCutoff <- 0.001
+params <- new("GOHyperGParams",
+              geneIds=selectedEntrezIds,
+              universeGeneIds=entrezUniverse,
+              annotation="mouse4302.db",
+              ontology="BP",
+              pvalueCutoff=hgCutoff,
+              conditional=FALSE,
+              testDirection="over")
+hgOver <- hyperGTest(params)
+hgOverAtLeast5GenesPerGOCategory <- hgOver %>% summary(categorySize=5)
+hgOverSummary <- hgOver %>% summary()
+
+qc_df <- data.frame(
+  Ontology=as.character(hgOverAtLeast5GenesPerGOCategory$Term),
+  log10.p.value=log10(hgOverAtLeast5GenesPerGOCategory$Pvalue)
+)
+
+qc_df %>% dplyr::slice(1:30) %>% ggplot(
+  aes(x=reorder(Ontology,-log10.p.value),y=-log10.p.value)) +
+  theme(legend.position="none") +
+  geom_bar(stat="identity", fill="lightgray") +
+  geom_text(position="stack",aes(label=round(-log10.p.value,digits=3),hjust=1.1)) +
+  coord_flip() +
+  labs(x="GO Biological Function",y="-log10(p-value)")
+```
+
+```{r go_xlsx}
+qc_df %>%
+  dplyr::arrange(log10.p.value) %>%
+  dplyr::mutate('term' = Ontology,'log10(p-value)' = log10.p.value) %>%
+  dplyr::select(-log10.p.value,-Ontology) %>%
+  write.xlsx(file="GOCategorySignificance.xlsx")
+```

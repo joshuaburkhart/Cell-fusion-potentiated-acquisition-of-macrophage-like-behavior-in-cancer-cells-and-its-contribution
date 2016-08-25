@@ -1,0 +1,726 @@
+---
+title: "GOIGOChord"
+author: "Joshua Burkhart"
+date: "August 23, 2016"
+output: 
+  pdf_document: 
+    latex_engine: xelatex
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      results='hide', # markup marks up the results; asis return texts as-is; hide hides the results
+                      comment=NA,
+                      message=FALSE,
+                      warning=FALSE,
+                      error=FALSE,
+                      fig.path="Figs/"
+                      )
+```
+
+```{r libs}
+library(knitr)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+library(xlsx)
+library(VennDiagram)
+library(GOstats)
+library(ALL)
+library(GO.db)
+library(annotate)
+library(genefilter)
+library(RColorBrewer)
+library(xtable)
+library(Rgraphviz)
+library(mouse4302.db)
+library(GOplot)
+library(pander)
+library(biomaRt)
+```
+
+```{r globals}
+# Assume working directory matches source file location
+# R Studio: Session->Set Working Directory->To Source File Location
+#setwd("/Users/joshuaburkhart/SoftwareProjects/CellFusionAnalysis/src/GOAnalysisVisualization/")
+ANOVA_DATA_ZIPPED <- "../../data/Copy of ANOVA Results February 06 2014.csv.zip"
+ANOVA_DATA_UNZIPPED_tmp <- "Copy of ANOVA Results February 06 2014.csv"
+```
+
+```{r helper_functions}
+# include some helper functions from https://github.com/cran/GOplot/blob/master/R/Helper.R
+
+##############
+# In general #
+##############
+
+# Theme blank
+theme_blank <- theme(axis.line = element_blank(), axis.text.x = element_blank(),
+                     axis.text.y = element_blank(), axis.ticks = element_blank(), axis.title.x = element_blank(),
+                     axis.title.y = element_blank(), panel.background = element_blank(), panel.border = element_blank(),
+                     panel.grid.major = element_blank(), panel.grid.minor = element_blank(), plot.background = element_blank())
+
+# Draw adjacent table for GOBubble and GOCircle
+draw_table <- function(data, col){
+  id <- term <- NULL
+  colnames(data) <- tolower(colnames(data))
+  if (missing(col)){
+    tt1 <- ttheme_default()
+  }else{
+    text.col <- c(rep(col[1], sum(data$category == 'BP')), rep(col[2], sum(data$category == 'CC')), rep(col[3], sum(data$category == 'MF')))
+    tt1 <- ttheme_minimal(
+      core = list(bg_params = list(fill = text.col, col=NA, alpha= 1/3)), 
+      colhead = list(fg_params = list(col = "black")))
+  }
+  table <- tableGrob(subset(data, select = c(id, term)), cols = c('ID', 'Description'), rows = NULL, theme = tt1)
+  return(table)
+}
+
+###########
+# GOChord #
+###########
+
+# Bezier function for drawing ribbons
+bezier <- function(data, process.col){
+  x <- c()
+  y <- c()
+  Id <- c()
+  sequ <- seq(0, 1, by = 0.01)
+  N <- dim(data)[1]
+  sN <- seq(1, N, by = 2)
+  if (process.col[1] == '') col_rain <- grDevices::rainbow(N) else col_rain <- process.col
+  for (n in sN){
+    xval <- c(); xval2 <- c(); yval <- c(); yval2 <- c()
+    for (t in sequ){
+      xva <- (1 - t) * (1 - t) * data$x.start[n] + t * t * data$x.end[n]
+      xval <- c(xval, xva)
+      xva2 <- (1 - t) * (1 - t) * data$x.start[n + 1] + t * t * data$x.end[n + 1]
+      xval2 <- c(xval2, xva2)
+      yva <- (1 - t) * (1 - t) * data$y.start[n] + t * t * data$y.end[n]  
+      yval <- c(yval, yva)
+      yva2 <- (1 - t) * (1 - t) * data$y.start[n + 1] + t * t * data$y.end[n + 1]
+      yval2 <- c(yval2, yva2)			
+    }
+    x <- c(x, xval, rev(xval2))
+    y <- c(y, yval, rev(yval2))
+    Id <- c(Id, rep(n, 2 * length(sequ)))
+  }
+  df <- data.frame(lx = x, ly = y, ID = Id)
+  return(df)
+}
+
+# Check function for GOChord argument 'limit'
+check_chord <- function(mat, limit){
+  
+  if(all(colSums(mat) >= limit[2]) & all(rowSums(mat) >= limit[1])) return(mat)
+  
+  tmp <- mat[(rowSums(mat) >= limit[1]),]
+  mat <- tmp[,(colSums(tmp) >= limit[2])]
+  
+  mat <- check_chord(mat, limit)
+  return(mat)
+}
+
+# patch GOChord function from https://github.com/cran/GOplot/blob/master/R/GOCluster.R
+# by adding gene.order='logFC2' option
+
+GOChordim <- function(data, title, space, gene.order, gene.size, gene.space, nlfc = 1, lfc.col, lfc.min, lfc.max, ribbon.col, border.size, process.label, limit){
+  y <- id <- xpro <- ypro <- xgen <- ygen <- lx <- ly <- ID <- logFC <- NULL
+  Ncol <- dim(data)[2]
+  
+  if (missing(title)) title <- ''
+  if (missing(space)) space = 0
+  if (missing(gene.order)) gene.order <- 'none'
+  if (missing(gene.size)) gene.size <- 3
+  if (missing(gene.space)) gene.space <- 0.2
+  if (missing(lfc.col)) lfc.col <- c('brown1', 'azure', 'cornflowerblue')
+  if (missing(lfc.min)) lfc.min <- -3
+  if (missing(lfc.max)) lfc.max <- 3
+  if (missing(border.size)) border.size <- 0.5
+  if (missing (process.label)) process.label <- 11
+  if (missing(limit)) limit <- c(0, 0)
+  
+  if (gene.order == 'logFC2') data <- data[order(data[, Ncol - 1], decreasing = T), ]
+  if (gene.order == 'logFC') data <- data[order(data[, Ncol], decreasing = T), ]
+  if (gene.order == 'alphabetical') data <- data[order(rownames(data)), ]
+  if (sum(!is.na(match(colnames(data), 'logFC'))) > 0){
+    if (nlfc == 1){
+      cdata <- check_chord(data[, 1:(Ncol - 1)], limit)
+      lfc <- sapply(rownames(cdata), function(x) data[match(x,rownames(data)), Ncol])
+    }else{
+      cdata <- check_chord(data[, 1:(Ncol - nlfc)], limit)
+      lfc <- sapply(rownames(cdata), function(x) data[, (Ncol - nlfc + 1)])
+    }
+  }else{
+    cdata <- check_chord(data, limit)
+    lfc <- 0
+  }
+  if (missing(ribbon.col)) colRib <- grDevices::rainbow(dim(cdata)[2]) else colRib <- ribbon.col
+  nrib <- colSums(cdata)
+  ngen <- rowSums(cdata)
+  Ncol <- dim(cdata)[2]
+  Nrow <- dim(cdata)[1]
+  colRibb <- c()
+  for (b in 1:length(nrib)) colRibb <- c(colRibb, rep(colRib[b], 202 * nrib[b]))
+  r1 <- 1; r2 <- r1 + 0.1
+  xmax <- c(); x <- 0
+  for (r in 1:length(nrib)){
+    perc <- nrib[r] / sum(nrib)
+    xmax <- c(xmax, (pi * perc) - space)
+    if (length(x) <= Ncol - 1) x <- c(x, x[r] + pi * perc)
+  }
+  xp <- c(); yp <- c()
+  l <- 50
+  for (s in 1:Ncol){
+    xh <- seq(x[s], x[s] + xmax[s], length = l)
+    xp <- c(xp, r1 * sin(x[s]), r1 * sin(xh), r1 * sin(x[s] + xmax[s]), r2 * sin(x[s] + xmax[s]), r2 * sin(rev(xh)), r2 * sin(x[s]))
+    yp <- c(yp, r1 * cos(x[s]), r1 * cos(xh), r1 * cos(x[s] + xmax[s]), r2 * cos(x[s] + xmax[s]), r2 * cos(rev(xh)), r2 * cos(x[s]))
+  }
+  df_process <- data.frame(x = xp, y = yp, id = rep(c(1:Ncol), each = 4 + 2 * l))
+  xp <- c(); yp <- c(); logs <- NULL
+  x2 <- seq(0 - space, -pi - (-pi / Nrow) - space, length = Nrow)
+  xmax2 <- rep(-pi / Nrow + space, length = Nrow)
+  for (s in 1:Nrow){
+    xh <- seq(x2[s], x2[s] + xmax2[s], length = l)
+    if (nlfc <= 1){
+      xp <- c(xp, (r1 + 0.05) * sin(x2[s]), (r1 + 0.05) * sin(xh), (r1 + 0.05) * sin(x2[s] + xmax2[s]), r2 * sin(x2[s] + xmax2[s]), r2 * sin(rev(xh)), r2 * sin(x2[s]))
+      yp <- c(yp, (r1 + 0.05) * cos(x2[s]), (r1 + 0.05) * cos(xh), (r1 + 0.05) * cos(x2[s] + xmax2[s]), r2 * cos(x2[s] + xmax2[s]), r2 * cos(rev(xh)), r2 * cos(x2[s]))
+    }else{
+      tmp <- seq(r1, r2, length = nlfc + 1)
+      for (t in 1:nlfc){
+        logs <- c(logs, data[s, (dim(data)[2] + 1 - t)])
+        xp <- c(xp, (tmp[t]) * sin(x2[s]), (tmp[t]) * sin(xh), (tmp[t]) * sin(x2[s] + xmax2[s]), tmp[t + 1] * sin(x2[s] + xmax2[s]), tmp[t + 1] * sin(rev(xh)), tmp[t + 1] * sin(x2[s]))
+        yp <- c(yp, (tmp[t]) * cos(x2[s]), (tmp[t]) * cos(xh), (tmp[t]) * cos(x2[s] + xmax2[s]), tmp[t + 1] * cos(x2[s] + xmax2[s]), tmp[t + 1] * cos(rev(xh)), tmp[t + 1] * cos(x2[s]))
+      }}}
+  if(lfc[1] != 0){
+    if (nlfc == 1){
+      df_genes <- data.frame(x = xp, y = yp, id = rep(c(1:Nrow), each = 4 + 2 * l), logFC = rep(lfc, each = 4 + 2 * l))
+    }else{
+      df_genes <- data.frame(x = xp, y = yp, id = rep(c(1:(nlfc*Nrow)), each = 4 + 2 * l), logFC = rep(logs, each = 4 + 2 * l))  
+    }
+  }else{
+    df_genes <- data.frame(x = xp, y = yp, id = rep(c(1:Nrow), each = 4 + 2 * l))
+  }
+  aseq <- seq(0, 180, length = length(x2)); angle <- c()
+  for (o in aseq) if((o + 270) <= 360) angle <- c(angle, o + 270) else angle <- c(angle, o - 90)
+  df_texg <- data.frame(xgen = (r1 + gene.space) * sin(x2 + xmax2/2),ygen = (r1 + gene.space) * cos(x2 + xmax2 / 2),labels = rownames(cdata), angle = angle)
+  df_texp <- data.frame(xpro = (r1 + 0.15) * sin(x + xmax / 2),ypro = (r1 + 0.15) * cos(x + xmax / 2), labels = colnames(cdata), stringsAsFactors = FALSE)
+  cols <- rep(colRib, each = 4 + 2 * l)
+  x.end <- c(); y.end <- c(); processID <- c()
+  for (gs in 1:length(x2)){
+    val <- seq(x2[gs], x2[gs] + xmax2[gs], length = ngen[gs] + 1)
+    pros <- which((cdata[gs, ] != 0) == T)
+    for (v in 1:(length(val) - 1)){
+      x.end <- c(x.end, sin(val[v]), sin(val[v + 1]))
+      y.end <- c(y.end, cos(val[v]), cos(val[v + 1]))
+      processID <- c(processID, rep(pros[v], 2))
+    }
+  }
+  df_bezier <- data.frame(x.end = x.end, y.end = y.end, processID = processID)
+  df_bezier <- df_bezier[order(df_bezier$processID,-df_bezier$y.end),]
+  x.start <- c(); y.start <- c()
+  for (rs in 1:length(x)){
+    val<-seq(x[rs], x[rs] + xmax[rs], length = nrib[rs] + 1)
+    for (v in 1:(length(val) - 1)){
+      x.start <- c(x.start, sin(val[v]), sin(val[v + 1]))
+      y.start <- c(y.start, cos(val[v]), cos(val[v + 1]))
+    }
+  }	
+  df_bezier$x.start <- x.start
+  df_bezier$y.start <- y.start
+  df_path <- bezier(df_bezier, colRib)
+  if(length(df_genes$logFC) != 0){
+    tmp <- sapply(df_genes$logFC, function(x) ifelse(x > lfc.max, lfc.max, x))
+    logFC <- sapply(tmp, function(x) ifelse(x < lfc.min, lfc.min, x))
+    df_genes$logFC <- logFC
+  }
+  
+  g<- ggplot() +
+    geom_polygon(data = df_process, aes(x, y, group=id), fill='gray70', inherit.aes = F,color='black') +
+    geom_polygon(data = df_process, aes(x, y, group=id), fill=cols, inherit.aes = F,alpha=0.6,color='black') +	
+    geom_point(aes(x = xpro, y = ypro, size = factor(labels, levels = labels), shape = NA), data = df_texp) +
+    guides(size = guide_legend("GO Terms", ncol = 4, byrow = T, override.aes = list(shape = 22, fill = unique(cols), size = 8))) +
+    theme(legend.text = element_text(size = process.label)) +
+    geom_text(aes(xgen, ygen, label = labels, angle = angle), data = df_texg, size = gene.size) +
+    geom_polygon(aes(x = lx, y = ly, group = ID), data = df_path, fill = colRibb, color = 'black', size = border.size, inherit.aes = F) +		
+    labs(title = title) +
+    theme_blank
+  
+  if (nlfc >= 1){
+    g + geom_polygon(data = df_genes, aes(x, y, group = id, fill = logFC), inherit.aes = F, color = 'black') +
+      scale_fill_gradient2('logFC', space = 'Lab', low = lfc.col[3], mid = lfc.col[2], high = lfc.col[1], guide = guide_colorbar(title.position = "top", title.hjust = 0.5), 
+                           breaks = c(min(df_genes$logFC), max(df_genes$logFC)), labels = c(round(min(df_genes$logFC)), round(max(df_genes$logFC)))) +
+      theme(legend.position = 'bottom', legend.background = element_rect(fill = 'transparent'), legend.box = 'horizontal', legend.direction = 'horizontal')
+  }else{
+    g + geom_polygon(data = df_genes, aes(x, y, group = id), fill = 'gray50', inherit.aes = F, color = 'black')+
+      theme(legend.position = 'bottom', legend.background = element_rect(fill = 'transparent'), legend.box = 'horizontal', legend.direction = 'horizontal')
+  }
+}
+```
+
+# GO Analysis for Genes of Interest
+
+```{r go_stats}
+# Read ANOVA data
+unzip(ANOVA_DATA_ZIPPED)
+anova_df <- read.table(ANOVA_DATA_UNZIPPED_tmp,header=T,sep="\t")
+file.remove(ANOVA_DATA_UNZIPPED_tmp)
+
+anova_df <- anova_df %>% dplyr::mutate(probesetid = as.character(probesetid))
+
+#remove control probes
+anova_df <- anova_df %>% dplyr::filter(!grepl("^AFFX",probesetid))
+
+#strip v affixes
+anova_df <- anova_df %>% dplyr::mutate(probesetid = gsub("^v","",probesetid))
+
+# From Falcon, S., Gentleman, R., How To Use GOstats Testing Gene Lists for GO Term Association, 2016, https://www.bioconductor.org/packages/release/bioc/vignettes/GOstats/inst/doc/GOstatsHyperG.pdf
+
+## Remove genes that have no entrezGene id
+entrezIds <- mget(anova_df$probesetid, envir=mouse4302ENTREZID, ifnotfound = NA)
+anova_df$entrezIds <- entrezIds
+haveEntrezId <- names(entrezIds[sapply(entrezIds,function(x) !is.na(x))])
+numNoEntrezId <- length(anova_df$probesetid) - length(haveEntrezId)
+anova_df <- anova_df %>% dplyr::filter(!is.na(entrezIds[probesetid]))
+
+## Remove genes with no GO mapping
+haveGo <- sapply(mget(anova_df$probesetid,mouse4302GO),
+  function(x) {
+    if(length(x) == 1 && is.na(x))
+      FALSE
+    else TRUE
+  })
+numNoGO <- sum(!haveGo)
+anova_df <- anova_df[haveGo,]
+
+## Non-specific filtering based on IQR
+iqrCutoff <- 0.5 # not using this
+anova_df$probesetidIqr <- apply(
+  anova_df %>% dplyr::select(
+    mc38mac1,mc38mac2,mc38mac3,mc38mac4,mc38mac5, # Hybrid
+    mc381,mc382,mc383,                            # MC-38
+    mac1,mac2,mac3                                # Macrophage
+    ),1,IQR)
+
+numNsWithDups <- length(anova_df$probesetid)
+nsFilteredIqr <- anova_df$probesetidIqr
+uniqGenes <- genefilter::findLargest(anova_df$probesetid,nsFilteredIqr,"mouse4302")
+nsFiltered <- anova_df %>% dplyr::filter(probesetid %in% uniqGenes)
+numSelected <- length(nsFiltered$probesetid)
+
+## Define gene universe based on results of non-specific filtering
+affyUniverse <- nsFiltered$probesetid
+entrezUniverse <- unlist(mget(affyUniverse, mouse4302ENTREZID))
+if(any(duplicated(entrezUniverse)))
+  stop("error in gene universe: can't have duplicate Entrez Gene Ids")
+## Also define an alternate universe based on the entire chip
+chipAffyUniverse <- anova_df$probesetid
+chipEntrezUniverse <- mget(chipAffyUniverse,mouse4302ENTREZID)
+chipEntrezUniverse <- unique(unlist(chipEntrezUniverse))
+
+# significantly up-regulated in Hybrid vs MC-38
+sig31_probes <- nsFiltered %>% dplyr::filter(sig31 == 1,d31 > 0)
+
+selectedEntrezIds <- unlist(mget(sig31_probes$probesetid,mouse4302ENTREZID))
+
+hgCutoff <- 0.001
+params <- new("GOHyperGParams",
+              geneIds=selectedEntrezIds,
+              universeGeneIds=entrezUniverse,
+              annotation="mouse4302.db",
+              ontology="BP",
+              pvalueCutoff=hgCutoff,
+              conditional=FALSE,
+              testDirection="over")
+hgOver <- hyperGTest(params)
+hgSummary <- hgOver %>% summary()
+
+# map entrez ids to GO categories
+probeSetSum0 <- probeSetSummary(hgOver,ids="ENTREZID")
+```
+
+```{r summarize_gois}
+# ensembl boilerplate
+ensembl <- useMart("ensembl",dataset="mmusculus_gene_ensembl")
+
+# get mgi_symbols for entrez ids
+mapTab <- getBM(attributes = c("entrezgene","mgi_symbol"),
+                filters = "entrezgene",
+                values = selectedEntrezIds,
+                mart = ensembl,
+                uniqueRows=FALSE)
+mapTab <- mapTab %>% dplyr::mutate(ID = as.character(entrezgene), Genes = as.character(entrezgene))
+
+# keep genes of interest (goi)
+goiList <- mapTab %>%
+  dplyr::filter(toupper(mgi_symbol) == "CSF1R" |
+                toupper(mgi_symbol) == "CSF2RB" |
+                toupper(mgi_symbol) == "CSF2RA" |
+                toupper(mgi_symbol) == "CXCL14" |
+                toupper(mgi_symbol) == "CXCL16" |
+                toupper(mgi_symbol) == "ADAM8" |
+                toupper(mgi_symbol) == "MMP13" |
+                toupper(mgi_symbol) == "ADAM10" |
+                toupper(mgi_symbol) == "CXCL12" |
+                toupper(mgi_symbol) == "TIMP3" |
+                toupper(mgi_symbol) == "SDF4" |
+                toupper(mgi_symbol) == "SDF2" |
+                toupper(mgi_symbol) == "TIMP2" |
+                toupper(mgi_symbol) == "MMP2" |
+                toupper(mgi_symbol) == "ICAM1" |
+                toupper(mgi_symbol) == "FZD3" |
+                toupper(mgi_symbol) == "PTPRC" | # CD45
+                toupper(mgi_symbol) == "IL2RG" |
+                toupper(mgi_symbol) == "CDKN2A" |
+                toupper(mgi_symbol) == "AQP1" |
+                toupper(mgi_symbol) == "SEMA4D")
+
+sig31_probes <- sig31_probes %>% dplyr::mutate(entrezgene = unlist(as.integer(entrezIds)))
+goiList <- goiList %>% dplyr::left_join(sig31_probes)
+
+goi_summary <- sig31_probes %>%
+  dplyr::filter(entrezgene %in% goiList$entrezgene)
+
+goiList <- goiList %>% dplyr::transmute(entrezgene = entrezgene, mgi_symbol = mgi_symbol)
+
+goi_sig31 <- goi_summary %>%
+  dplyr::filter(sig31 == 1) %>%
+  dplyr::left_join(goiList) %>%
+  dplyr::select(probesetid,
+                d14, d31, d21, d54, d21_54, d31_54,
+                sig14,sig31,sig21,sig54,sig21_54,sig31_54,
+                entrezgene, mgi_symbol)
+```
+
+```{r build_david}
+# build david data structure for GOplot
+david <- data.frame(
+  Category = "BP",
+  ID = hgSummary$GOBPID,
+  Term = hgSummary$Term,
+  adj_pval = hgSummary$Pvalue
+)
+
+# add list of mapped entrez ids to each row
+david <- david %>%
+  dplyr::rowwise() %>% 
+  dplyr::mutate(Genes = probeSetSum0[[ID]] %>%
+                  dplyr::select(EntrezID) %>% as.list())
+```
+
+```{r modify_david}
+# expand lists, creating one row for each entrez id
+david <- david %>% tidyr::unnest(Genes) %>%
+  dplyr::mutate(entrezgene = as.integer(Genes)) %>%
+  dplyr::left_join(goiList) %>%
+  unique() %>% 
+  dplyr::arrange(mgi_symbol,Term)
+```
+
+```{r prepare_data_for_gochord}
+genelist_goi_sig31 <- data.frame(
+  ID = goi_sig31$entrezgene,
+  logFC = 1.0 #placeholder
+)
+
+gene_logFC_map <- data.frame(
+  ID = goi_sig31$entrezgene,
+  logFC_d21 = goi_sig31$d21,
+  logFC_d31 = goi_sig31$d31
+)
+
+# force mgi_symbol into genelist ID column
+genelist_goi_sig31 <- genelist_goi_sig31 %>% dplyr::mutate(ID = as.character(ID))
+gene_logFC_map <- gene_logFC_map %>% dplyr::mutate(ID = as.character(ID))
+
+genelist_goi_sig31 <- genelist_goi_sig31 %>% dplyr::left_join(mapTab %>% dplyr::select(ID,mgi_symbol))
+gene_logFC_map <- gene_logFC_map %>% dplyr::left_join(mapTab %>% dplyr::select(ID,mgi_symbol))
+
+# upper case forced by circle_dat
+genelist_goi_sig31 <- genelist_goi_sig31 %>% dplyr::mutate(ID = as.character(mgi_symbol) %>% toupper())
+gene_logFC_map <- gene_logFC_map %>% dplyr::mutate(ID = as.character(mgi_symbol) %>% toupper())
+
+genelist_goi_sig31 <- genelist_goi_sig31 %>% na.omit()
+gene_logFC_map <- gene_logFC_map %>% na.omit()
+
+david_goi_sig31 <- david %>% dplyr::left_join(mapTab %>% dplyr::select(Genes,mgi_symbol))
+# upper case forced by circle_dat
+david_goi_sig31 <- david_goi_sig31 %>% dplyr::mutate(Genes = as.character(mgi_symbol) %>% toupper())
+david_goi_sig31 <- david_goi_sig31 %>% na.omit()
+
+# not sure about this... It's not clear whether or not the genelist needs to be a subset of david.
+genelist_goi_sig31 <- genelist_goi_sig31 %>% dplyr::filter(ID %in% david_goi_sig31$Genes)
+gene_logFC_map <- gene_logFC_map %>% dplyr::filter(ID %in% david_goi_sig31$Genes)
+
+genelist_goi_sig31 <- genelist_goi_sig31 %>% dplyr::transmute(ID = ID,logFC = logFC)
+david_goi_sig31 <- david_goi_sig31 %>% dplyr::filter(Genes %in% genelist_goi_sig31$ID)
+david_goi_sig31 <- david_goi_sig31 %>% dplyr::transmute(Category=Category,ID=ID,Term=Term,adj_pval=adj_pval,Genes=Genes)
+
+# build circ structure
+circ_goi_sig31 <- GOplot::circle_dat(david_goi_sig31,genelist_goi_sig31)
+
+# have to track down a bug here... http://stackoverflow.com/questions/15031338/subscript-out-of-bounds-general-definition-and-solution
+chord_goi_sig31 <- GOplot::chord_dat(circ_goi_sig31,genes = genelist_goi_sig31)
+
+# play with chord_invasion to add both logFC's
+chord_goi_sig31 <- as.data.frame(chord_goi_sig31)
+chord_goi_sig31 <- chord_goi_sig31 %>% dplyr::add_rownames()
+gene_logFC_map <- gene_logFC_map %>%
+  dplyr::transmute(rowname = ID, logFC_d21 = logFC_d21, logFC_d31 = logFC_d31)
+chord_goi_sig31 <- chord_goi_sig31 %>% dplyr::left_join(by="rowname",gene_logFC_map %>%
+                                                        dplyr::select(rowname,logFC_d21,logFC_d31))
+rownames(chord_goi_sig31) <- chord_goi_sig31$rowname
+
+chord_goi_sig31 <- chord_goi_sig31 %>% dplyr::select(-rowname)
+```
+
+```{r filter_go_categories_of_interest}
+# filter and combine GO categories according to CellFusionGOGroups.md
+
+extravasation <- c("regulation of cellular extravasation",
+"positive regulation of cellular extravasation")
+
+adhesion <- c("leukocyte cell-cell adhesion",
+"homotypic cell-cell adhesion",
+"cell adhesion",
+"cell-cell adhesion",
+"biological adhesion",
+"positive regulation of leukocyte cell-cell adhesion",
+"regulation of leukocyte cell-cell adhesion",
+"positive regulation of cell-cell adhesion",
+"regulation of cell adhesion",
+"regulation of homotypic cell-cell adhesion",
+"regulation of cell-cel adhesion",
+"positive regulation of homotypic cell-cell adhesion",
+"positive regulation of cell adhesion",
+"cell adhesion mediated by integrin",
+"positive regulation of cell adhesion mediated by integrin",
+"regulation of cell adhesion mediated by integrin")
+
+migration <- c("leukocyte migration",
+"locomotion",
+"cell migration", 
+"cell motility",
+"regulation of locomotion",
+"positive regulation of leukocyte migration",
+"regulation of cell motility",
+"regulation of cell migration",
+"regulation of leukocyte migration",
+"neutrophil migration",
+"lymphocyte migration",
+"positive regulation of neutrophil migration",
+"positive regulation of cell migration",
+"granulocyte migration",
+"regulation of neutrophil migration",
+"regulation of lymphocyte migration",
+"T cell migration",
+"myeloid leukocyte migration",
+"positive regulation of lymphocyte migration",
+"regulation of T cell migration")
+
+chemotaxis <- c("leukocyte chemotaxis",
+"neutrophil chemotaxis",
+"cell chemotaxis",
+"positive regulation of leukocyte chemotaxis",
+"granulocyte chemotaxis",
+"positive regulation of neutrophil chemotaxis",
+"regulation of leukocyte chemotaxis",
+"positive regulation of granulocyte chemotaxis",
+"regulation of neutrophil chemotaxis",
+"chemotaxis",  
+"taxis")
+
+cytokine_stimulus <- c("cellular response to cytokine stimulus",
+"cellular response to chemical stimulus",
+"response to cytokine",
+"regulation of response to stimulus",
+"response to chemical",
+"cellular response to stimulus",
+"regulation of response to cytokine stimulus",  
+"positive regulation of response to stimulus",
+"response to external stimulus")
+
+signaling_pathway <- c("immune response-regulating signaling pathway", 
+"immune response-activating cell surface receptor signaling pathway",
+"immune response-regulating cell surface receptor signaling pathway",
+"regulation of cytokine-mediated signaling pathway",
+"cytokine-mediated signaling pathway",  
+"intracellular signal transduction",
+"cell surface receptor signaling pathway",
+"positive regulation of response to external stimulus",
+"regulation of signal transduction",
+"regulation of B cell receptor signaling pathway")
+
+chord_goi_sig31_colnames <- chord_goi_sig31 %>% colnames()
+
+extravasation_intsct <- chord_goi_sig31_colnames %>% intersect(extravasation)
+adhesion_intsct <- chord_goi_sig31_colnames %>% intersect(adhesion)
+migration_intsct <- chord_goi_sig31_colnames %>% intersect(migration)
+chemotaxis_intsct <- chord_goi_sig31_colnames %>% intersect(chemotaxis)
+cytokine_stimulus_intsct <- chord_goi_sig31_colnames %>% intersect(cytokine_stimulus)
+signaling_pathway_intsct <- chord_goi_sig31_colnames %>% intersect(signaling_pathway)
+
+extravasation_intsct %>% length()     #0
+adhesion_intsct %>% length()          #10
+migration_intsct %>% length()         #5
+chemotaxis_intsct %>% length()        #0
+cytokine_stimulus_intsct %>% length() #4
+signaling_pathway_intsct %>% length() #6
+
+c(extravasation_intsct,
+  adhesion_intsct,
+  migration_intsct,
+  chemotaxis_intsct,
+  cytokine_stimulus_intsct,
+  signaling_pathway_intsct)
+
+#extravasation_scores <- #no results
+adhesion_scores <- chord_goi_sig31[,adhesion_intsct] %>% rowSums() > 0
+migration_scores <- chord_goi_sig31[,migration_intsct] %>% rowSums() > 0
+#chemotaxis_scores <- #no results
+cytokine_stimulus_scores <- chord_goi_sig31[,cytokine_stimulus_intsct] %>% rowSums() > 0
+signaling_pathway_scores <- chord_goi_sig31[,signaling_pathway_intsct] %>% rowSums() > 0
+
+adhesion_binary <- ifelse(adhesion_scores,1,0)
+migration_binary <- ifelse(migration_scores,1,0)
+cytokine_stimulus_binary <- ifelse(cytokine_stimulus_scores,1,0)
+signaling_pathway_binary <- ifelse(signaling_pathway_scores,1,0)
+
+chord_goi_sig31_summarized <- chord_goi_sig31 %>% dplyr::select(logFC,logFC_d21,logFC_d31)
+chord_goi_sig31_summarized <- chord_goi_sig31_summarized %>% dplyr::mutate(logFC = logFC_d31) #set logFC_d31 to outer ring
+chord_goi_sig31_summarized <- chord_goi_sig31_summarized %>% dplyr::select(-logFC_d31)
+rownames(chord_goi_sig31_summarized) <- chord_goi_sig31 %>% rownames()
+rownames(chord_goi_sig31_summarized)[rownames(chord_goi_sig31_summarized) == "PTPRC"] <- "CD45"
+chord_goi_sig31_summarized <- cbind(
+  adhesion = adhesion_binary,chord_goi_sig31_summarized)
+chord_goi_sig31_summarized <- cbind(
+  migration = migration_binary,chord_goi_sig31_summarized)
+chord_goi_sig31_summarized <- cbind(
+  cytokine.stimulus = cytokine_stimulus_binary,chord_goi_sig31_summarized)
+chord_goi_sig31_summarized <- cbind(
+  signaling.pathway = signaling_pathway_binary,chord_goi_sig31_summarized)
+```
+
+```{r convert_chord_df_to_matrix}
+chord_goi_sig31_summarized <- as.matrix(chord_goi_sig31_summarized)
+```
+
+### Writing GOChord SVG to "D31_goi_GOChord_summarized.svg"
+
+```{r build_gochord_svg}
+# GO Chord SVG
+svg(filename="D31_goi_GOChord_summarized.svg",
+    width=15,
+    height=15,
+    pointsize=12)
+GOChordim(chord_goi_sig31_summarized,
+                space=0.01,
+                gene.size=6,
+                gene.order='logFC2',
+                gene.space=0.2,
+                nlfc=2,
+                ribbon.col=c("green4","red3","dodgerblue3","darkorchid4"),
+                lfc.min = -7,#chord_goi_sig31_summarized[,c("logFC","logFC_d21")] %>% min(),
+                lfc.max = 7,#chord_goi_sig31_summarized[,c("logFC","logFC_d21")] %>% max(),
+                lfc.col=c("red","white","black"))
+dev.off()
+```
+
+### Writing GOChord TIFF to "D31_goi_GOChord_summarized.tiff"
+
+```{r build_gochord_TIFF}
+# GO Chord JPEG
+tiff(filename="D31_goi_GOChord_summarized.tiff",
+    units="in",
+    width=15,
+    height=15,
+    pointsize=12,
+    res=96)
+GOChordim(chord_goi_sig31_summarized,
+                space=0.01,
+                gene.size=6,
+                gene.order='logFC2',
+                gene.space=0.2,
+                nlfc=2,
+                ribbon.col=c("green4","red3","dodgerblue3","darkorchid4"),
+                lfc.min = -7,#chord_goi_sig31_summarized[,c("logFC","logFC_d21")] %>% min(),
+                lfc.max = 7,#chord_goi_sig31_summarized[,c("logFC","logFC_d21")] %>% max(),
+                lfc.col=c("red","white","black"))
+dev.off()
+```
+
+### Writing logFC SVG to "logFC_empirical_density.svg"
+
+```{r build_logFC_density}
+# logFC density
+svg(filename="logFC_empirical_density.svg",
+    width=7,
+    height=7,
+    pointsize=12)
+chord_goi_sig31_summarized[,c("logFC","logFC_d21")] %>%
+  as.list() %>%
+  as.data.frame() %>%
+  melt() %>%
+  ggplot() +
+  geom_density(aes(value)) +
+  xlab("logFC") +
+  ylab("Density of Mac & Hyb logFC's vs MC-38")
+dev.off()
+```
+
+### GO Category Tables
+#### Adhesion
+
+```{r adhesion_go_table, echo=FALSE, results='asis'}
+panderOptions('table.alignment.default', function(df) ifelse(sapply(df, is.numeric), 'right', 'left'))
+
+hgSummary %>% 
+  dplyr::filter(Term %in% adhesion_intsct) %>%
+  dplyr::select(Term,Pvalue) %>%
+  dplyr::mutate(log10.p.value = log10(Pvalue)) %>%
+  dplyr::arrange(log10.p.value) %>%
+  pander(split.cells = 50, split.table = Inf)
+```
+
+#### Migration
+
+```{r migration_go_table, echo=FALSE, results='asis'}
+panderOptions('table.alignment.default', function(df) ifelse(sapply(df, is.numeric), 'right', 'left'))
+
+hgSummary %>% 
+  dplyr::filter(Term %in% migration_intsct) %>%
+  dplyr::select(Term,Pvalue) %>%
+  dplyr::mutate(log10.p.value = log10(Pvalue)) %>%
+  dplyr::arrange(log10.p.value) %>%
+  pander(split.cells = 50, split.table = Inf)
+```
+
+#### Cytokine Stimulus
+
+```{r cytokine-stimulus_go_table, echo=FALSE, results='asis'}
+panderOptions('table.alignment.default', function(df) ifelse(sapply(df, is.numeric), 'right', 'left'))
+
+hgSummary %>% 
+  dplyr::filter(Term %in% cytokine_stimulus_intsct) %>%
+  dplyr::select(Term,Pvalue) %>%
+  dplyr::mutate(log10.p.value = log10(Pvalue)) %>%
+  dplyr::arrange(log10.p.value) %>%
+  pander(split.cells = 50, split.table = Inf)
+```
+
+#### Signaling Pathway
+
+```{r signaling-pathway_go_table, echo=FALSE, results='asis'}
+panderOptions('table.alignment.default', function(df) ifelse(sapply(df, is.numeric), 'right', 'left'))
+
+hgSummary %>% 
+  dplyr::filter(Term %in% signaling_pathway_intsct) %>%
+  dplyr::select(Term,Pvalue) %>%
+  dplyr::mutate(log10.p.value = log10(Pvalue)) %>%
+  dplyr::arrange(log10.p.value) %>%
+  pander(split.cells = 50, split.table = Inf)
+```
+
+

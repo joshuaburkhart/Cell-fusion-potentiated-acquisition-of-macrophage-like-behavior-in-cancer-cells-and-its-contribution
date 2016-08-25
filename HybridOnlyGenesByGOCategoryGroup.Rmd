@@ -1,0 +1,390 @@
+---
+title: "HybridOnlyGenesByGOCategoryGroup"
+author: "Joshua Burkhart"
+date: "August 24, 2016"
+output: 
+  pdf_document: 
+    latex_engine: xelatex
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(echo=FALSE,
+                      results='hide', # markup marks up the results; asis return texts as-is; hide hides the results
+                      comment=NA,
+                      message=FALSE,
+                      warning=FALSE,
+                      error=FALSE,
+                      fig.path="Figs/"
+                      )
+```
+
+```{r libs}
+library(knitr)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+library(xlsx)
+library(VennDiagram)
+library(GOstats)
+library(ALL)
+library(GO.db)
+library(annotate)
+library(genefilter)
+library(RColorBrewer)
+library(xtable)
+library(Rgraphviz)
+library(mouse4302.db)
+library(GOplot)
+library(pander)
+library(biomaRt)
+library(lazyeval)
+library(xlsx)
+```
+
+```{r globals}
+# Assume working directory matches source file location
+# R Studio: Session->Set Working Directory->To Source File Location
+#setwd("/Users/joshuaburkhart/SoftwareProjects/CellFusionAnalysis/src/GOAnalysisVisualization/")
+ANOVA_DATA_ZIPPED <- "../../data/Copy of ANOVA Results February 06 2014.csv.zip"
+ANOVA_DATA_UNZIPPED_tmp <- "Copy of ANOVA Results February 06 2014.csv"
+```
+
+```{r helper_functions}
+  tc_name <- as.name('term')
+  lc_name <- as.name('log10(p-value)')
+  pc_name <- as.name('probesetid')
+  gc_name <- as.name('genes')
+  hc_name <- as.name('Differential Hybrid/MC38')
+  mc_name <- as.name('Differential Mac/MC38')
+
+write_pretty_xlsx <- function(x, filename){
+    x %>%
+    dplyr::arrange(desc(d31),
+                   go_pvalue) %>%
+    dplyr::mutate('log10(p-value)' = log10(go_pvalue),
+                  'Differential Hybrid/MC38' = d31,
+                  'Differential Mac/MC38' = d21) %>%
+    dplyr::distinct_(tc_name,
+                     lc_name,
+                     pc_name,
+                     gc_name,
+                     hc_name,
+                     mc_name) %>%
+    write.xlsx(file=filename)
+}
+```
+
+# GO Analysis for Differentially expressed Hybrid/MC38 genes
+
+```{r go_stats}
+# Read ANOVA data
+unzip(ANOVA_DATA_ZIPPED)
+anova_df <- read.table(ANOVA_DATA_UNZIPPED_tmp,header=T,sep="\t")
+file.remove(ANOVA_DATA_UNZIPPED_tmp)
+
+anova_df <- anova_df %>% dplyr::mutate(probesetid = as.character(probesetid))
+
+#remove control probes
+anova_df <- anova_df %>% dplyr::filter(!grepl("^AFFX",probesetid))
+
+#strip v affixes
+anova_df <- anova_df %>% dplyr::mutate(probesetid = gsub("^v","",probesetid))
+
+# From Falcon, S., Gentleman, R., How To Use GOstats Testing Gene Lists for GO Term Association, 2016, https://www.bioconductor.org/packages/release/bioc/vignettes/GOstats/inst/doc/GOstatsHyperG.pdf
+
+## Remove genes that have no entrezGene id
+entrezIds <- mget(anova_df$probesetid, envir=mouse4302ENTREZID, ifnotfound = NA)
+anova_df$entrezIds <- entrezIds
+haveEntrezId <- names(entrezIds[sapply(entrezIds,function(x) !is.na(x))])
+numNoEntrezId <- length(anova_df$probesetid) - length(haveEntrezId)
+anova_df <- anova_df %>% dplyr::filter(!is.na(entrezIds[probesetid]))
+
+## Remove genes with no GO mapping
+haveGo <- sapply(mget(anova_df$probesetid,mouse4302GO),
+  function(x) {
+    if(length(x) == 1 && is.na(x))
+      FALSE
+    else TRUE
+  })
+numNoGO <- sum(!haveGo)
+anova_df <- anova_df[haveGo,]
+
+## Non-specific filtering based on IQR
+iqrCutoff <- 0.5 # not using this
+anova_df$probesetidIqr <- apply(
+  anova_df %>% dplyr::select(
+    mc38mac1,mc38mac2,mc38mac3,mc38mac4,mc38mac5, # Hybrid
+    mc381,mc382,mc383,                            # MC-38
+    mac1,mac2,mac3                                # Macrophage
+    ),1,IQR)
+
+numNsWithDups <- length(anova_df$probesetid)
+nsFilteredIqr <- anova_df$probesetidIqr
+uniqGenes <- genefilter::findLargest(anova_df$probesetid,nsFilteredIqr,"mouse4302")
+nsFiltered <- anova_df %>% dplyr::filter(probesetid %in% uniqGenes)
+numSelected <- length(nsFiltered$probesetid)
+
+## Define gene universe based on results of non-specific filtering
+affyUniverse <- nsFiltered$probesetid
+entrezUniverse <- unlist(mget(affyUniverse, mouse4302ENTREZID))
+if(any(duplicated(entrezUniverse)))
+  stop("error in gene universe: can't have duplicate Entrez Gene Ids")
+## Also define an alternate universe based on the entire chip
+chipAffyUniverse <- anova_df$probesetid
+chipEntrezUniverse <- mget(chipAffyUniverse,mouse4302ENTREZID)
+chipEntrezUniverse <- unique(unlist(chipEntrezUniverse))
+
+# significantly up-regulated in Hybrid vs MC-38
+sig31_probes <- nsFiltered %>% dplyr::filter(sig31 == 1,d31 > 0)
+
+selectedEntrezIds <- unlist(mget(sig31_probes$probesetid,mouse4302ENTREZID))
+
+hgCutoff <- 0.001
+params <- new("GOHyperGParams",
+              geneIds=selectedEntrezIds,
+              universeGeneIds=entrezUniverse,
+              annotation="mouse4302.db",
+              ontology="BP",
+              pvalueCutoff=hgCutoff,
+              conditional=FALSE,
+              testDirection="over")
+hgOver <- hyperGTest(params)
+hgSummary <- hgOver %>% summary()
+
+# map entrez ids to GO categories
+probeSetSum0 <- probeSetSummary(hgOver,ids="ENTREZID")
+```
+
+```{r summarize_gois}
+# ensembl boilerplate
+ensembl <- useMart("ensembl",dataset="mmusculus_gene_ensembl")
+
+# get mgi_symbols for entrez ids
+mapTab <- getBM(attributes = c("entrezgene","mgi_symbol"),
+                filters = "entrezgene",
+                values = selectedEntrezIds,
+                mart = ensembl,
+                uniqueRows=FALSE)
+mapTab <- mapTab %>% dplyr::mutate(ID = as.character(entrezgene), Genes = as.character(entrezgene))
+
+# match gene symbol to regex's
+goiList <- mapTab
+#goiList <- mapTab %>% subset(grepl("Adam.*",mgi_symbol) | 
+#                             grepl("Mmp.*",mgi_symbol) | 
+#                             grepl("Timp.*",mgi_symbol) | 
+#                             grepl("Csf.*",mgi_symbol) | 
+#                             grepl("Sdf.*",mgi_symbol) | 
+#                             grepl("Cxc.*",mgi_symbol))
+
+sig31_probes <- sig31_probes %>% dplyr::mutate(entrezgene = unlist(as.integer(entrezIds)))
+goiList <- goiList %>% dplyr::left_join(sig31_probes)
+
+goi_summary <- sig31_probes %>%
+  dplyr::filter(entrezgene %in% goiList$entrezgene)
+
+goiList <- goiList %>% dplyr::transmute(entrezgene = entrezgene, mgi_symbol = mgi_symbol)
+
+goi_sig31 <- goi_summary %>%
+  dplyr::left_join(goiList) %>%
+  dplyr::select(probesetid,
+                d14, d31, d21, d54, d21_54, d31_54,
+                sig14,sig31,sig21,sig54,sig21_54,sig31_54,
+                entrezgene, mgi_symbol)
+```
+
+```{r build_david}
+# build david data structure for GOplot
+david <- data.frame(
+  Category = "BP",
+  ID = hgSummary$GOBPID,
+  Term = hgSummary$Term,
+  adj_pval = hgSummary$Pvalue
+)
+
+# add list of mapped entrez ids to each row
+david <- david %>%
+  dplyr::rowwise() %>% 
+  dplyr::mutate(Genes = probeSetSum0[[ID]] %>%
+                  dplyr::select(EntrezID) %>% as.list())
+```
+
+```{r modify_david}
+# expand lists, creating one row for each entrez id
+david <- david %>% tidyr::unnest(Genes) %>%
+  dplyr::mutate(entrezgene = as.integer(Genes)) %>%
+  dplyr::left_join(goiList) %>%
+  unique() %>% 
+  dplyr::arrange(mgi_symbol,Term)
+```
+
+```{r prepare_data_for_circ}
+genelist_goi_sig31 <- data.frame(
+  ID = goi_sig31$entrezgene,
+  logFC = 1.0 #placeholder
+)
+
+gene_logFC_map <- data.frame(
+  ID = goi_sig31$entrezgene,
+  logFC_d21 = goi_sig31$d21,
+  logFC_d31 = goi_sig31$d31
+)
+
+# force mgi_symbol into genelist ID column
+genelist_goi_sig31 <- genelist_goi_sig31 %>% dplyr::mutate(ID = as.character(ID))
+gene_logFC_map <- gene_logFC_map %>% dplyr::mutate(ID = as.character(ID))
+
+genelist_goi_sig31 <- genelist_goi_sig31 %>% dplyr::left_join(mapTab %>% dplyr::select(ID,mgi_symbol))
+gene_logFC_map <- gene_logFC_map %>% dplyr::left_join(mapTab %>% dplyr::select(ID,mgi_symbol))
+
+# upper case forced by circle_dat
+genelist_goi_sig31 <- genelist_goi_sig31 %>% dplyr::mutate(ID = as.character(mgi_symbol) %>% toupper())
+gene_logFC_map <- gene_logFC_map %>% dplyr::mutate(ID = as.character(mgi_symbol) %>% toupper())
+
+genelist_goi_sig31 <- genelist_goi_sig31 %>% na.omit()
+gene_logFC_map <- gene_logFC_map %>% na.omit()
+
+david_goi_sig31 <- david %>% dplyr::left_join(mapTab %>% dplyr::select(Genes,mgi_symbol))
+# upper case forced by circle_dat
+david_goi_sig31 <- david_goi_sig31 %>% dplyr::mutate(Genes = as.character(mgi_symbol) %>% toupper())
+david_goi_sig31 <- david_goi_sig31 %>% na.omit()
+
+# not sure about this... It's not clear whether or not the genelist needs to be a subset of david.
+genelist_goi_sig31 <- genelist_goi_sig31 %>% dplyr::filter(ID %in% david_goi_sig31$Genes)
+gene_logFC_map <- gene_logFC_map %>% dplyr::filter(ID %in% david_goi_sig31$Genes)
+
+genelist_goi_sig31 <- genelist_goi_sig31 %>% dplyr::transmute(ID = ID,logFC = logFC)
+david_goi_sig31 <- david_goi_sig31 %>% dplyr::filter(Genes %in% genelist_goi_sig31$ID)
+david_goi_sig31 <- david_goi_sig31 %>% dplyr::transmute(Category=Category,ID=ID,Term=Term,adj_pval=adj_pval,Genes=Genes)
+
+# build circ structure
+circ_goi_sig31 <- GOplot::circle_dat(david_goi_sig31,genelist_goi_sig31)
+```
+
+```{r connect_circ_to_gene_logFC}
+#make mgi_symbols in goi_sig31 uppercase 'genes' column (to match circ)
+goi_sig31 <- goi_sig31 %>% dplyr::mutate(genes = toupper(mgi_symbol))
+
+#left-join goi_sig31 onto circ by genes for d31 (logFC)
+joined_go_genes <- circ_goi_sig31 %>% dplyr::left_join(goi_sig31 %>% dplyr::select(genes,probesetid,d21,d31,sig21,sig31))
+
+#rename adj_pval
+joined_go_genes <- joined_go_genes %>% dplyr::mutate(go_pvalue = adj_pval)
+```
+
+```{r filter_go_categories_of_interest}
+# filter and combine GO categories according to CellFusionGOGroups.md
+
+extravasation <- c("regulation of cellular extravasation",
+"positive regulation of cellular extravasation")
+
+adhesion <- c("leukocyte cell-cell adhesion",
+"homotypic cell-cell adhesion",
+"cell adhesion",
+"cell-cell adhesion",
+"biological adhesion",
+"positive regulation of leukocyte cell-cell adhesion",
+"regulation of leukocyte cell-cell adhesion",
+"positive regulation of cell-cell adhesion",
+"regulation of cell adhesion",
+"regulation of homotypic cell-cell adhesion",
+"regulation of cell-cel adhesion",
+"positive regulation of homotypic cell-cell adhesion",
+"positive regulation of cell adhesion",
+"cell adhesion mediated by integrin",
+"positive regulation of cell adhesion mediated by integrin",
+"regulation of cell adhesion mediated by integrin")
+
+migration <- c("leukocyte migration",
+"locomotion",
+"cell migration", 
+"cell motility",
+"regulation of locomotion",
+"positive regulation of leukocyte migration",
+"regulation of cell motility",
+"regulation of cell migration",
+"regulation of leukocyte migration",
+"neutrophil migration",
+"lymphocyte migration",
+"positive regulation of neutrophil migration",
+"positive regulation of cell migration",
+"granulocyte migration",
+"regulation of neutrophil migration",
+"regulation of lymphocyte migration",
+"T cell migration",
+"myeloid leukocyte migration",
+"positive regulation of lymphocyte migration",
+"regulation of T cell migration")
+
+chemotaxis <- c("leukocyte chemotaxis",
+"neutrophil chemotaxis",
+"cell chemotaxis",
+"positive regulation of leukocyte chemotaxis",
+"granulocyte chemotaxis",
+"positive regulation of neutrophil chemotaxis",
+"regulation of leukocyte chemotaxis",
+"positive regulation of granulocyte chemotaxis",
+"regulation of neutrophil chemotaxis",
+"chemotaxis",  
+"taxis")
+
+cytokine_stimulus <- c("cellular response to cytokine stimulus",
+"cellular response to chemical stimulus",
+"response to cytokine",
+"regulation of response to stimulus",
+"response to chemical",
+"cellular response to stimulus",
+"regulation of response to cytokine stimulus",  
+"positive regulation of response to stimulus",
+"response to external stimulus")
+
+signaling_pathway <- c("immune response-regulating signaling pathway", 
+"immune response-activating cell surface receptor signaling pathway",
+"immune response-regulating cell surface receptor signaling pathway",
+"regulation of cytokine-mediated signaling pathway",
+"cytokine-mediated signaling pathway",  
+"intracellular signal transduction",
+"cell surface receptor signaling pathway",
+"positive regulation of response to external stimulus",
+"regulation of signal transduction",
+"regulation of B cell receptor signaling pathway")
+```
+
+## Writing Adhesion Data to Adhesion.xlsx
+
+```{r adhesion_go_table, echo=FALSE, results='asis'}
+joined_go_genes %>% 
+  dplyr::filter(term %in% adhesion) %>%
+  write_pretty_xlsx(filename="Adhesion.xlsx")
+```
+
+## Writing Migration Data to Migration.xlsx
+
+```{r migration_go_table, echo=FALSE, results='asis'}
+joined_go_genes %>% 
+  dplyr::filter(term %in% migration) %>%
+  write_pretty_xlsx(filename="Migration.xlsx")
+```
+
+## Writing Cytokine Stimulus Data to Cytokine_Stimulus.xlsx
+
+```{r cytokine-stimulus_go_table, echo=FALSE, results='asis'}
+joined_go_genes %>% 
+  dplyr::filter(term %in% cytokine_stimulus) %>%
+  write_pretty_xlsx(filename="Cytokine_Stimulus.xlsx")
+```
+
+## Writing Signaling Pathway Data to Signaling_Pathway.xlsx
+
+```{r signaling-pathway_go_table, echo=FALSE, results='asis'}
+joined_go_genes %>% 
+  dplyr::filter(term %in% signaling_pathway) %>%
+  write_pretty_xlsx(filename="Signaling_Pathway.xlsx")
+```
+
+## Writing Data to GOCategoryGenes.xlsx
+```{r all_data_go_table, echo=FALSE, results='asis'}
+joined_go_genes %>% 
+  write_pretty_xlsx(filename="GOCategoryGenes.xlsx")
+```
