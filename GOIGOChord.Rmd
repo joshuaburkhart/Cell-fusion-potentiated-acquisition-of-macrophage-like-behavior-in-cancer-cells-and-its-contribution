@@ -1,7 +1,7 @@
 ---
 title: "GOIGOChord"
 author: "Joshua Burkhart"
-date: "August 23, 2016"
+date: "August 31, 2016"
 output: 
   pdf_document: 
     latex_engine: xelatex
@@ -644,7 +644,7 @@ GOChordim(chord_goi_sig31_summarized,
                 gene.order='logFC2',
                 gene.space=0.2,
                 nlfc=2,
-                ribbon.col=c("green4","red3","dodgerblue3","darkorchid4"),
+                ribbon.col=c("green4","gold","dodgerblue3","darkorchid4"),
                 lfc.min = -7,#chord_goi_sig31_summarized[,c("logFC","logFC_d21")] %>% min(),
                 lfc.max = 7,#chord_goi_sig31_summarized[,c("logFC","logFC_d21")] %>% max(),
                 lfc.col=c("red","white","black"))
