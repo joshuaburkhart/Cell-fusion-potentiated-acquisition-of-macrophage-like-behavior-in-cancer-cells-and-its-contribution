@@ -375,7 +375,9 @@ goiList <- mapTab %>%
                 toupper(mgi_symbol) == "IL2RG" |
                 toupper(mgi_symbol) == "CDKN2A" |
                 toupper(mgi_symbol) == "AQP1" |
-                toupper(mgi_symbol) == "SEMA4D")
+                toupper(mgi_symbol) == "SEMA4D" |
+                toupper(mgi_symbol) == "ITGB1" |
+                toupper(mgi_symbol) == "ITGB5")
 
 sig31_probes <- sig31_probes %>% dplyr::mutate(entrezgene = unlist(as.integer(entrezIds)))
 goiList <- goiList %>% dplyr::left_join(sig31_probes)
